@@ -10,6 +10,8 @@ import Combine
 
 final class FocusedWindowTracker {
     private var cancellables = Set<AnyCancellable>()
+    private var profileAwareWindowObserver: AXObserver?
+    private var observedProfileAwarePid: pid_t?
 
     private let workspaceRepository: WorkspaceRepository
     private let workspaceManager: WorkspaceManager
@@ -52,10 +54,18 @@ final class FocusedWindowTracker {
             .delay(for: .seconds(1), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in self?.activateWorkspaceForFocusedApp(force: true) }
             .store(in: &cancellables)
+
+        NotificationCenter.default
+            .publisher(for: .profileAwareFocusedWindowChanged)
+            .sink { [weak self] _ in self?.profileAwareFocusedWindowChanged() }
+            .store(in: &cancellables)
+
+        updateProfileAwareWindowObserver(for: NSWorkspace.shared.frontmostApplication)
     }
 
     func stopTracking() {
         cancellables.removeAll()
+        removeProfileAwareWindowObserver()
     }
 
     private func activateWorkspaceForFocusedApp(force: Bool = false) {
@@ -67,6 +77,8 @@ final class FocusedWindowTracker {
     }
 
     private func activeApplicationChanged(_ app: NSRunningApplication, force: Bool) {
+        updateProfileAwareWindowObserver(for: app)
+
         let workspaceSettings = settingsRepository.workspaceSettings
         let pipSettings = settingsRepository.pictureInPictureSettings
         let shouldActivate = workspaceSettings.activeWorkspaceOnFocusChange &&
@@ -84,11 +96,16 @@ final class FocusedWindowTracker {
 
         workspaceManager.invalidateInactiveWorkspaces()
 
+        let prioritizedWorkspaces = Array(activeWorkspaces) + workspaceRepository.workspaces
+        let workspace = workspaceManager.workspaceForProfileAwareWindow(
+            app,
+            prioritizedWorkspaces: prioritizedWorkspaces
+        ) ?? prioritizedWorkspaces.first(where: { $0.apps.containsApp(app) })
+
         // Find the workspace that contains the app.
         // The same app can be in multiple workspaces, the highest priority has the one
         // from the active workspace.
-        guard let workspace = (activeWorkspaces + workspaceRepository.workspaces)
-            .first(where: { $0.apps.containsApp(app) }) else { return }
+        guard let workspace else { return }
 
         // Skip if the workspace is already active
         guard activeWorkspaces.count(where: { $0.id == workspace.id }) < workspace.displays.count else { return }
@@ -102,7 +119,9 @@ final class FocusedWindowTracker {
             Logger.log("")
             Logger.log("")
             Logger.log("Activating workspace for app: \(workspace.name)")
-            workspaceManager.updateLastFocusedApp(app.toMacApp, in: workspace)
+            if !workspaceManager.rememberFocusedProfileAwareWindow(app, in: workspace) {
+                workspaceManager.updateLastFocusedApp(app.toMacApp, in: workspace)
+            }
             workspaceManager.activateWorkspace(workspace, setFocus: false)
             app.activate()
 
@@ -119,6 +138,84 @@ final class FocusedWindowTracker {
         } else {
             activate()
         }
+    }
+
+    private func profileAwareFocusedWindowChanged() {
+        DispatchQueue.main.async {
+            guard let app = NSWorkspace.shared.frontmostApplication else { return }
+
+            let prioritizedWorkspaces = Array(self.workspaceManager.activeWorkspace.values) +
+                self.workspaceRepository.workspaces
+
+            if let workspace = self.workspaceManager.workspaceForProfileAwareWindow(
+                app,
+                prioritizedWorkspaces: prioritizedWorkspaces
+            ) {
+                _ = self.workspaceManager.rememberFocusedProfileAwareWindow(app, in: workspace)
+
+                let activeWorkspaces = self.workspaceManager.activeWorkspace.values
+                let isWorkspaceActive = activeWorkspaces
+                    .count(where: { $0.id == workspace.id }) >= workspace.displays.count
+
+                guard !isWorkspaceActive else { return }
+
+                self.workspaceManager.activateWorkspace(workspace, setFocus: false)
+                app.activate()
+                return
+            }
+
+            _ = self.workspaceManager.rememberFocusedProfileAwareWindow(app)
+        }
+    }
+
+    private func updateProfileAwareWindowObserver(for app: NSRunningApplication?) {
+        guard let app, shouldObserveProfileAwareWindowChanges(for: app) else {
+            removeProfileAwareWindowObserver()
+            return
+        }
+
+        guard observedProfileAwarePid != app.processIdentifier else { return }
+
+        removeProfileAwareWindowObserver()
+
+        let callback: AXObserverCallback = { _, _, _, _ in
+            NotificationCenter.default.post(name: .profileAwareFocusedWindowChanged, object: nil)
+        }
+        var observer: AXObserver?
+        let result = AXObserverCreate(app.processIdentifier, callback, &observer)
+
+        guard result == .success, let observer else { return }
+
+        let appRef = AXUIElementCreateApplication(app.processIdentifier)
+        AXObserverAddNotification(observer, appRef, kAXFocusedWindowChangedNotification as CFString, nil)
+        AXObserverAddNotification(observer, appRef, kAXMainWindowChangedNotification as CFString, nil)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+
+        profileAwareWindowObserver = observer
+        observedProfileAwarePid = app.processIdentifier
+    }
+
+    private func removeProfileAwareWindowObserver() {
+        guard let observer = profileAwareWindowObserver else {
+            observedProfileAwarePid = nil
+            return
+        }
+
+        if let observedProfileAwarePid {
+            let appRef = AXUIElementCreateApplication(observedProfileAwarePid)
+            AXObserverRemoveNotification(observer, appRef, kAXFocusedWindowChangedNotification as CFString)
+            AXObserverRemoveNotification(observer, appRef, kAXMainWindowChangedNotification as CFString)
+        }
+
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        profileAwareWindowObserver = nil
+        observedProfileAwarePid = nil
+    }
+
+    private func shouldObserveProfileAwareWindowChanges(for app: NSRunningApplication) -> Bool {
+        workspaceRepository.workspaces
+            .flatMap(\.profileAwareApps)
+            .contains { $0.bundleIdentifier == app.bundleIdentifier }
     }
 
     private func autoAssignAppToWorkspaceIfNeeded(_ app: NSRunningApplication) {

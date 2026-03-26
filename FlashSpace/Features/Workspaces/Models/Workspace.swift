@@ -35,6 +35,14 @@ struct Workspace: Identifiable, Codable, Hashable {
 }
 
 extension Workspace {
+    var profileAwareApps: [MacApp] {
+        apps.filter(\.isProfileAwareBrowser)
+    }
+
+    func profileAwareApp(with bundleIdentifier: BundleId?) -> MacApp? {
+        profileAwareApps.first { $0.bundleIdentifier == bundleIdentifier }
+    }
+
     var displays: Set<DisplayName> {
         if NSScreen.screens.count == 1 {
             return [.current]

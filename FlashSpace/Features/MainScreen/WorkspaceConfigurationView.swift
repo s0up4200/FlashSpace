@@ -41,6 +41,13 @@ struct WorkspaceConfigurationView: View {
             }
 
             openAppsToggle
+
+            if viewModel.workspaceApps?.contains(where: { $0.isGoogleChrome && $0.browserProfile != nil }) == true {
+                Text("Chrome profile entries auto-open the selected profile. Existing Chrome windows are still managed app-wide.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 270, alignment: .leading)
+            }
         }
         .disabled(viewModel.selectedWorkspaceId == nil)
     }
@@ -74,7 +81,7 @@ struct WorkspaceConfigurationView: View {
     private var focusApp: some View {
         Picker("Focus App:", selection: $viewModel.workspaceAppToFocus) {
             ForEach(viewModel.focusAppOptions, id: \.self) {
-                Text($0.name.padEnd(toLength: 40)).tag($0)
+                Text($0.displayName.padEnd(toLength: 40)).tag($0)
             }
         }
         .frame(width: 270, alignment: .leading)

@@ -19,6 +19,38 @@ struct ActiveWorkspace {
     let display: DisplayName
 }
 
+struct ProfileAwareWorkspaceFocusPlan {
+    let shouldFocusProfileAwareWindow: Bool
+    let shouldActivateAppBeforeWindowFocus: Bool
+    let shouldActivateAppAfterWindowFocus: Bool
+
+    init(
+        appToFocusBundleIdentifier: BundleId?,
+        profileAwareWindowAppBundleIdentifier: BundleId?,
+        appToFocusIsFinderFallback: Bool = false
+    ) {
+        let hasProfileAwareWindow = profileAwareWindowAppBundleIdentifier != nil
+        let appMatchesProfileAwareWindow = appToFocusBundleIdentifier == profileAwareWindowAppBundleIdentifier
+
+        shouldFocusProfileAwareWindow = hasProfileAwareWindow &&
+            (appToFocusBundleIdentifier == nil || appMatchesProfileAwareWindow || appToFocusIsFinderFallback)
+        shouldActivateAppBeforeWindowFocus = shouldFocusProfileAwareWindow &&
+            (appToFocusBundleIdentifier == nil || appToFocusIsFinderFallback)
+        shouldActivateAppAfterWindowFocus = if appToFocusBundleIdentifier == nil {
+            false
+        } else if !hasProfileAwareWindow {
+            true
+        } else {
+            !appMatchesProfileAwareWindow && !appToFocusIsFinderFallback
+        }
+    }
+}
+
+private struct WorkspaceAppFocusSelection {
+    let app: NSRunningApplication?
+    let isFinderFallback: Bool
+}
+
 // swiftlint:disable:next type_body_length
 final class WorkspaceManager: ObservableObject {
     @Published private(set) var activeWorkspaceDetails: ActiveWorkspace?
@@ -32,6 +64,8 @@ final class WorkspaceManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var observeFocusCancellable: AnyCancellable?
     private var appsHiddenManually: [WorkspaceID: [MacApp]] = [:]
+    private var profileAwareWindowAssignments = ProfileAwareWindowAssignments()
+    private var recentAppOpenTimes: [MacApp: Date] = [:]
     private let hideAgainSubject = PassthroughSubject<Workspace, Never>()
 
     private lazy var focusedWindowTracker = AppDependencies.shared.focusedWindowTracker
@@ -72,20 +106,12 @@ final class WorkspaceManager: ObservableObject {
 
         NotificationCenter.default
             .publisher(for: .profileChanged)
-            .sink { [weak self] _ in
-                self?.activeWorkspace = [:]
-                self?.mostRecentWorkspace = [:]
-                self?.activeWorkspaceDetails = nil
-            }
+            .sink { [weak self] _ in self?.resetActiveWorkspaceState() }
             .store(in: &cancellables)
 
         NotificationCenter.default
             .publisher(for: NSApplication.didChangeScreenParametersNotification)
-            .sink { [weak self] _ in
-                self?.activeWorkspace = [:]
-                self?.mostRecentWorkspace = [:]
-                self?.activeWorkspaceDetails = nil
-            }
+            .sink { [weak self] _ in self?.resetActiveWorkspaceState() }
             .store(in: &cancellables)
 
         workspaceRepository.workspacesPublisher
@@ -95,6 +121,12 @@ final class WorkspaceManager: ObservableObject {
             .store(in: &cancellables)
 
         observeFocus()
+    }
+
+    private func resetActiveWorkspaceState() {
+        activeWorkspace = [:]
+        mostRecentWorkspace = [:]
+        activeWorkspaceDetails = nil
     }
 
     private func observeFocus() {
@@ -124,9 +156,13 @@ final class WorkspaceManager: ObservableObject {
 
         let focusedDisplay = DisplayName.current
 
-        if let activeWorkspace = activeWorkspace[focusedDisplay], activeWorkspace.apps.containsApp(application) {
-            updateLastFocusedApp(application.toMacApp, in: activeWorkspace)
-            updateActiveWorkspace(activeWorkspace, on: [focusedDisplay])
+        if let activeWorkspace = activeWorkspace[focusedDisplay] {
+            if rememberFocusedProfileAwareWindow(application, in: activeWorkspace) {
+                updateActiveWorkspace(activeWorkspace, on: [focusedDisplay])
+            } else if activeWorkspace.apps.containsApp(application) {
+                updateLastFocusedApp(application.toMacApp, in: activeWorkspace)
+                updateActiveWorkspace(activeWorkspace, on: [focusedDisplay])
+            }
         }
 
         displayManager.trackDisplayFocus(on: focusedDisplay, for: application)
@@ -148,51 +184,108 @@ final class WorkspaceManager: ObservableObject {
         let regularApps = NSWorkspace.shared.runningRegularApps
         let floatingApps = floatingAppsSettings.floatingApps
         let hiddenApps = appsHiddenManually[workspace.id] ?? []
+        let profileAwareBundleIds = workspaceRepository.workspaces
+            .flatMap(\.profileAwareApps)
+            .map(\.bundleIdentifier)
+            .asSet
         var appsToShow = regularApps
             .filter { !hiddenApps.containsApp($0) }
             .filter {
-                workspace.apps.containsApp($0) ||
-                    floatingApps.containsApp($0) && $0.isOnAnyDisplay(displays)
+                !profileAwareBundleIds.contains($0.bundleIdentifier ?? "") &&
+                    (workspace.apps.containsApp($0) ||
+                        floatingApps.containsApp($0) && $0.isOnAnyDisplay(displays)
+                    )
             }
 
         observeFocusCancellable = nil
         defer { observeFocus() }
 
+        let profileAwareWindowToFocus = focusedProfileAwareWindow(in: workspace)
+
         if setFocus {
-            let toFocus = findAppToFocus(in: workspace, apps: appsToShow)
+            let focusSelection = findAppToFocus(in: workspace, apps: appsToShow)
+            let toFocus = focusSelection.app
 
-            // Make sure to raise the app that should be focused
-            // as the last one
-            if let toFocus {
-                appsToShow.removeAll { $0 == toFocus }
-                appsToShow.append(toFocus)
-            }
+            moveFocusedAppToEnd(of: &appsToShow, appToFocus: toFocus)
+            showRegularApps(appsToShow, appToFocus: toFocus)
 
-            for app in appsToShow {
-                Logger.log("SHOW: \(app.localizedName ?? "")")
+            let focusedFrame = focusWorkspaceSelection(
+                workspace,
+                appToFocus: toFocus,
+                focusSelection: focusSelection,
+                profileAwareWindowToFocus: profileAwareWindowToFocus
+            )
 
-                if app == toFocus || app.isHidden || app.isMinimized {
-                    app.raise()
-                }
-
-                pictureInPictureManager.showPipAppIfNeeded(app: app)
-                pictureInPictureManager.showCornerHiddenAppIfNeeded(app: app)
-            }
-
-            Logger.log("FOCUS: \(toFocus?.localizedName ?? "")")
-            toFocus?.activate()
-            centerCursorIfNeeded(in: toFocus?.frame)
+            centerCursorIfNeeded(in: focusedFrame ?? toFocus?.frame)
         } else {
             for app in appsToShow {
                 Logger.log("SHOW: \(app.localizedName ?? "")")
                 app.raise()
             }
+
+            restoreProfileAwareWindows(in: workspace, focusWindow: false)
         }
+    }
+
+    private func moveFocusedAppToEnd(of appsToShow: inout [NSRunningApplication], appToFocus: NSRunningApplication?) {
+        guard let appToFocus else { return }
+
+        appsToShow.removeAll { $0 == appToFocus }
+        appsToShow.append(appToFocus)
+    }
+
+    private func showRegularApps(_ appsToShow: [NSRunningApplication], appToFocus: NSRunningApplication?) {
+        for app in appsToShow {
+            Logger.log("SHOW: \(app.localizedName ?? "")")
+
+            if app == appToFocus || app.isHidden || app.isMinimized {
+                app.raise()
+            }
+
+            pictureInPictureManager.showPipAppIfNeeded(app: app)
+            pictureInPictureManager.showCornerHiddenAppIfNeeded(app: app)
+        }
+    }
+
+    private func focusWorkspaceSelection(
+        _ workspace: Workspace,
+        appToFocus: NSRunningApplication?,
+        focusSelection: WorkspaceAppFocusSelection,
+        profileAwareWindowToFocus: (app: NSRunningApplication, window: AXUIElement)?
+    ) -> CGRect? {
+        Logger.log("FOCUS: \(appToFocus?.localizedName ?? "")")
+
+        let focusPlan = ProfileAwareWorkspaceFocusPlan(
+            appToFocusBundleIdentifier: appToFocus?.bundleIdentifier,
+            profileAwareWindowAppBundleIdentifier: profileAwareWindowToFocus?.app.bundleIdentifier,
+            appToFocusIsFinderFallback: focusSelection.isFinderFallback
+        )
+
+        let focusedProfileAwareFrame: CGRect?
+        if focusPlan.shouldFocusProfileAwareWindow {
+            focusedProfileAwareFrame = focusProfileAwareWindowIfNeeded(
+                profileAwareWindowToFocus,
+                activateApp: focusPlan.shouldActivateAppBeforeWindowFocus
+            )
+        } else {
+            restoreProfileAwareWindows(in: workspace, focusWindow: false)
+            focusedProfileAwareFrame = nil
+        }
+
+        if focusPlan.shouldActivateAppAfterWindowFocus {
+            appToFocus?.activate()
+        }
+
+        return focusedProfileAwareFrame
     }
 
     private func hideApps(in workspace: Workspace) {
         let regularApps = NSWorkspace.shared.runningRegularApps
         let workspaceApps = workspace.apps + floatingAppsSettings.floatingApps
+        let profileAwareBundleIds = workspaceRepository.workspaces
+            .flatMap(\.profileAwareApps)
+            .map(\.bundleIdentifier)
+            .asSet
         let isAnyWorkspaceAppRunning = regularApps
             .contains { workspaceApps.containsApp($0) }
         let allAssignedApps = workspaceRepository.workspaces
@@ -203,7 +296,9 @@ final class WorkspaceManager: ObservableObject {
 
         let appsToHide = regularApps
             .filter {
-                !$0.isHidden && !workspaceApps.containsApp($0) &&
+                !$0.isHidden &&
+                    !profileAwareBundleIds.contains($0.bundleIdentifier ?? "") &&
+                    !workspaceApps.containsApp($0) &&
                     (!workspaceSettings.keepUnassignedAppsOnSwitch || allAssignedApps.contains($0.bundleIdentifier ?? ""))
             }
             .filter { isAnyWorkspaceAppRunning || $0.bundleURL?.fileName != "Finder" }
@@ -217,12 +312,14 @@ final class WorkspaceManager: ObservableObject {
                 app.hide()
             }
         }
+
+        minimizeProfileAwareWindows(excluding: workspace, on: displays)
     }
 
     private func findAppToFocus(
         in workspace: Workspace,
         apps: [NSRunningApplication]
-    ) -> NSRunningApplication? {
+    ) -> WorkspaceAppFocusSelection {
         if workspace.appToFocus == nil {
             let displays = workspace.displays
             if let floatingEntry = displayManager.lastFocusedDisplay(where: {
@@ -232,7 +329,7 @@ final class WorkspaceManager: ObservableObject {
                 return (isFloating || isUnassigned) && displays.contains($0.display)
             }),
                 let runningApp = NSWorkspace.shared.runningApplications.find(floatingEntry.app) {
-                return runningApp
+                return .init(app: runningApp, isFinderFallback: false)
             }
         }
 
@@ -247,7 +344,15 @@ final class WorkspaceManager: ObservableObject {
         let fallbackToLastApp = apps.findFirstMatch(with: workspace.apps.reversed())
         let fallbackToFinder = NSWorkspace.shared.runningApplications.first(where: \.isFinder)
 
-        return appToFocus ?? fallbackToLastApp ?? fallbackToFinder
+        if let appToFocus {
+            return .init(app: appToFocus, isFinderFallback: false)
+        }
+
+        if let fallbackToLastApp {
+            return .init(app: fallbackToLastApp, isFinderFallback: false)
+        }
+
+        return .init(app: fallbackToFinder, isFinderFallback: fallbackToFinder != nil)
     }
 
     private func centerCursorIfNeeded(in frame: CGRect?) {
@@ -293,20 +398,43 @@ final class WorkspaceManager: ObservableObject {
 
         workspace.apps
             .filter {
-                !runningBundleIds.contains($0.bundleIdentifier) &&
-                    $0.autoOpen == true
+                shouldOpen($0, runningBundleIds: runningBundleIds)
             }
-            .compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.bundleIdentifier) }
-            .forEach { appUrl in
-                Logger.log("Open App: \(appUrl)")
+            .forEach { app in
+                guard let appUrl = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleIdentifier) else {
+                    return
+                }
+
+                Logger.log("Open App: \(appUrl) \(app.launchArguments.joined(separator: " "))")
 
                 let config = NSWorkspace.OpenConfiguration()
+                config.arguments = app.launchArguments
+                recentAppOpenTimes[app] = Date()
+
                 NSWorkspace.shared.openApplication(at: appUrl, configuration: config) { _, error in
                     if let error {
                         Logger.log("Failed to open \(appUrl): \(error.localizedDescription)")
+                        self.recentAppOpenTimes.removeValue(forKey: app)
                     }
                 }
             }
+    }
+
+    private func shouldOpen(_ app: MacApp, runningBundleIds: Set<BundleId>) -> Bool {
+        guard app.autoOpen == true, app.bundleIdentifier.isNotEmpty else { return false }
+
+        if let recentOpenTime = recentAppOpenTimes[app],
+           Date().timeIntervalSince(recentOpenTime) < 2.0 {
+            return false
+        }
+
+        if app.isGoogleChrome, app.browserProfile != nil {
+            // Chrome profile windows are not runtime-classified yet,
+            // so we reopen the target profile on activation.
+            return true
+        }
+
+        return !runningBundleIds.contains(app.bundleIdentifier)
     }
 
     private func rememberHiddenApps(workspaceToActivate: WorkspaceID?) {
@@ -348,6 +476,124 @@ final class WorkspaceManager: ObservableObject {
         lastWorkspaceActivation = Date()
         activeWorkspaceDetails = nil
         activeWorkspace.removeValue(forKey: display)
+    }
+
+    @discardableResult
+    func rememberFocusedProfileAwareWindow(
+        _ application: NSRunningApplication,
+        in workspace: Workspace? = nil
+    ) -> Bool {
+        let targetWorkspace = workspace ?? activeWorkspace[DisplayName.current]
+
+        guard let targetWorkspace,
+              let appTarget = targetWorkspace.profileAwareApp(with: application.bundleIdentifier),
+              rememberProfileAwareWindow(for: application, target: appTarget, in: targetWorkspace) else {
+            return false
+        }
+
+        updateLastFocusedApp(appTarget, in: targetWorkspace)
+        return true
+    }
+
+    private func rememberProfileAwareWindow(
+        for application: NSRunningApplication,
+        target appTarget: MacApp,
+        in workspace: Workspace
+    ) -> Bool {
+        guard let window = application.focusedWindow,
+              let windowId = window.cgWindowId else { return false }
+
+        profileAwareWindowAssignments.remember(windowId: windowId, window: window, for: appTarget, in: workspace.id)
+        return true
+    }
+
+    private func focusedProfileAwareWindow(in workspace: Workspace) -> (app: NSRunningApplication, window: AXUIElement)? {
+        for appTarget in workspace.profileAwareApps {
+            guard let runningApp = NSWorkspace.shared.runningApplications
+                .first(where: { $0.bundleIdentifier == appTarget.bundleIdentifier }) else {
+                continue
+            }
+
+            if let window = profileAwareWindowAssignments.window(for: appTarget, in: workspace.id) {
+                return (runningApp, window)
+            }
+
+            guard let windowId = profileAwareWindowAssignments.windowId(for: appTarget, in: workspace.id),
+                  let window = runningApp.allWindows
+                  .map(\.window)
+                  .first(where: { $0.cgWindowId == windowId }) else {
+                continue
+            }
+
+            return (runningApp, window)
+        }
+
+        return nil
+    }
+
+    @discardableResult
+    private func focusProfileAwareWindowIfNeeded(
+        _ entry: (app: NSRunningApplication, window: AXUIElement)?,
+        activateApp: Bool
+    ) -> CGRect? {
+        guard let entry else { return nil }
+
+        entry.app.unhide()
+        entry.window.minimize(false)
+        if activateApp {
+            entry.app.activate()
+        }
+        entry.window.focus()
+
+        return entry.window.frame
+    }
+
+    private func restoreProfileAwareWindows(in workspace: Workspace, focusWindow: Bool) {
+        guard let entry = focusedProfileAwareWindow(in: workspace) else { return }
+
+        entry.app.unhide()
+        entry.window.minimize(false)
+
+        if focusWindow {
+            entry.app.activate()
+            entry.window.focus()
+        }
+    }
+
+    private func minimizeProfileAwareWindows(excluding workspace: Workspace, on displays: Set<DisplayName>) {
+        let protectedWindowIds = profileAwareWindowAssignments.windowIds(in: workspace.id)
+
+        for otherWorkspace in workspaceRepository.workspaces where otherWorkspace.id != workspace.id {
+            let windowIds = profileAwareWindowAssignments.windowIds(in: otherWorkspace.id)
+                .subtracting(protectedWindowIds)
+
+            guard windowIds.isNotEmpty else { continue }
+
+            for appTarget in otherWorkspace.profileAwareApps {
+                guard let runningApp = NSWorkspace.shared.runningApplications
+                    .first(where: { $0.bundleIdentifier == appTarget.bundleIdentifier }) else {
+                    continue
+                }
+
+                for window in runningApp.allWindows.map(\.window)
+                    where windowIds.contains(window.cgWindowId ?? 0) &&
+                    window.frame?.getDisplay().flatMap(displays.contains) == true {
+                    window.minimize(true)
+                }
+            }
+        }
+    }
+
+    func workspaceForProfileAwareWindow(_ application: NSRunningApplication, prioritizedWorkspaces: [Workspace]) -> Workspace? {
+        guard let windowId = application.focusedWindow?.cgWindowId,
+              let workspaceId = profileAwareWindowAssignments.workspaceId(
+                  for: windowId,
+                  prioritizedWorkspaces: prioritizedWorkspaces
+              ) else {
+            return nil
+        }
+
+        return workspaceRepository.findWorkspace(with: workspaceId)
     }
 }
 

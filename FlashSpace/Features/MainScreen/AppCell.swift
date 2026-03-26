@@ -21,8 +21,16 @@ struct AppCell: View {
                     .scaledToFit()
                     .frame(width: 20, height: 20)
             }
-            Text(app.name)
-                .foregroundColor(app.bundleIdentifier.isEmpty ? .errorRed : .primary)
+            VStack(alignment: .leading, spacing: 1.0) {
+                Text(app.displayName)
+                    .foregroundColor(app.bundleIdentifier.isEmpty ? .errorRed : .primary)
+
+                if let detailText = app.detailText {
+                    Text(detailText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             if viewModel.isEditingApps {
                 Spacer()

@@ -9,28 +9,38 @@ import AppKit
 
 typealias BundleId = String
 
+struct BrowserProfile: Codable, Hashable {
+    let directory: String
+    let name: String
+    let email: String?
+}
+
 struct MacApp: Codable, Hashable, Equatable {
     var name: String
     var bundleIdentifier: BundleId
     var iconPath: String?
     var autoOpen: Bool?
+    var browserProfile: BrowserProfile?
 
     init(
         name: String,
         bundleIdentifier: BundleId,
         iconPath: String?,
-        autoOpen: Bool?
+        autoOpen: Bool?,
+        browserProfile: BrowserProfile? = nil
     ) {
         self.name = name
         self.bundleIdentifier = bundleIdentifier
         self.iconPath = iconPath
         self.autoOpen = autoOpen
+        self.browserProfile = browserProfile
     }
 
     init(app: NSRunningApplication) {
         self.name = app.localizedName ?? ""
         self.bundleIdentifier = app.bundleIdentifier ?? ""
         self.iconPath = app.iconPath
+        self.browserProfile = nil
     }
 
     init(from decoder: any Decoder) throws {
@@ -63,6 +73,7 @@ struct MacApp: Codable, Hashable, Equatable {
             self.bundleIdentifier = try container.decode(String.self, forKey: .bundleIdentifier)
             self.iconPath = try container.decodeIfPresent(String.self, forKey: .iconPath)
             self.autoOpen = try container.decodeIfPresent(Bool.self, forKey: .autoOpen)
+            self.browserProfile = try container.decodeIfPresent(BrowserProfile.self, forKey: .browserProfile)
         }
     }
 
@@ -71,6 +82,7 @@ struct MacApp: Codable, Hashable, Equatable {
             hasher.combine(name)
         } else {
             hasher.combine(bundleIdentifier)
+            hasher.combine(browserProfile?.directory)
         }
     }
 
@@ -78,13 +90,36 @@ struct MacApp: Codable, Hashable, Equatable {
         if lhs.bundleIdentifier.isEmpty || rhs.bundleIdentifier.isEmpty {
             return lhs.name == rhs.name
         } else {
-            return lhs.bundleIdentifier == rhs.bundleIdentifier
+            return lhs.bundleIdentifier == rhs.bundleIdentifier &&
+                lhs.browserProfile?.directory == rhs.browserProfile?.directory
         }
     }
 }
 
 extension MacApp {
+    var displayName: String {
+        guard let browserProfile else { return name }
+        return "\(name) - \(browserProfile.name)"
+    }
+
+    var detailText: String? {
+        browserProfile?.email
+    }
+
     var isFinder: Bool {
         bundleIdentifier == "com.apple.finder"
+    }
+
+    var isGoogleChrome: Bool {
+        bundleIdentifier == "com.google.Chrome"
+    }
+
+    var isProfileAwareBrowser: Bool {
+        isGoogleChrome && browserProfile != nil
+    }
+
+    var launchArguments: [String] {
+        guard isGoogleChrome, let browserProfile else { return [] }
+        return ["--profile-directory=\(browserProfile.directory)"]
     }
 }

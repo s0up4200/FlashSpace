@@ -58,8 +58,10 @@ final class MainViewModel: ObservableObject {
 
     @Published var isSymbolPickerPresented = false
     @Published var isInputDialogPresented = false
+    @Published var isGoogleChromeProfilePickerPresented = false
     @Published var isEditingApps = false
     @Published var userInput = ""
+    @Published private(set) var googleChromeProfiles: [BrowserProfile] = []
 
     var focusAppOptions: [MacApp] {
         [AppConstants.lastFocusedOption] + (workspaceApps ?? [])
@@ -109,6 +111,7 @@ final class MainViewModel: ObservableObject {
 
     private var cancellables: Set<AnyCancellable> = []
     private var loadingWorkspace = false
+    private var pendingGoogleChromeApp: MacApp?
 
     private let workspaceManager = AppDependencies.shared.workspaceManager
     private let workspaceRepository = AppDependencies.shared.workspaceRepository
@@ -261,20 +264,45 @@ extension MainViewModel {
             return
         }
 
-        guard !(workspaceApps ?? []).containsApp(with: appBundleId) else { return }
-
-        workspaceRepository.addApp(
-            to: selectedWorkspaceId,
-            app: .init(
-                name: appName,
-                bundleIdentifier: appBundleId,
-                iconPath: appUrl.iconPath,
-                autoOpen: isOpenAppsOnActivationEnabled ? true : nil
-            )
+        let app = MacApp(
+            name: appName,
+            bundleIdentifier: appBundleId,
+            iconPath: appUrl.iconPath,
+            autoOpen: isOpenAppsOnActivationEnabled ? true : nil
         )
 
-        reloadWorkspaces()
-        workspaceManager.activateWorkspaceIfActive(selectedWorkspaceId)
+        if app.isGoogleChrome {
+            let profiles = GoogleChromeProfileCatalog.load()
+
+            guard profiles.isNotEmpty else {
+                Alert.showOkAlert(
+                    title: appName,
+                    message: "No Google Chrome profiles found in Local State."
+                )
+                return
+            }
+
+            pendingGoogleChromeApp = app
+            googleChromeProfiles = profiles
+            isGoogleChromeProfilePickerPresented = true
+            return
+        }
+
+        addApp(app, to: selectedWorkspaceId)
+    }
+
+    func addGoogleChromeProfile(_ profile: BrowserProfile) {
+        guard let selectedWorkspaceId, var app = pendingGoogleChromeApp else { return }
+
+        app.browserProfile = profile
+        cancelGoogleChromeProfileSelection()
+        addApp(app, to: selectedWorkspaceId)
+    }
+
+    func cancelGoogleChromeProfileSelection() {
+        pendingGoogleChromeApp = nil
+        googleChromeProfiles = []
+        isGoogleChromeProfilePickerPresented = false
     }
 
     func deleteSelectedApps() {
@@ -304,5 +332,13 @@ extension MainViewModel {
             return false
         }
         return refreshedApp.autoOpen ?? false
+    }
+
+    private func addApp(_ app: MacApp, to workspaceId: WorkspaceID) {
+        guard workspaceRepository.findWorkspace(with: workspaceId)?.apps.contains(app) != true else { return }
+
+        workspaceRepository.addApp(to: workspaceId, app: app)
+        reloadWorkspaces()
+        workspaceManager.activateWorkspaceIfActive(workspaceId)
     }
 }

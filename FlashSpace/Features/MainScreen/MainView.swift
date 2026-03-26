@@ -31,6 +31,13 @@ struct MainView: View {
         .sheet(isPresented: $viewModel.isSymbolPickerPresented) {
             SymbolPicker(symbol: $viewModel.workspaceSymbolIconName)
         }
+        .sheet(isPresented: $viewModel.isGoogleChromeProfilePickerPresented) {
+            GoogleChromeProfilePicker(
+                profiles: viewModel.googleChromeProfiles,
+                onSelect: viewModel.addGoogleChromeProfile,
+                onCancel: viewModel.cancelGoogleChromeProfileSelection
+            )
+        }
     }
 
     private var workspaces: some View {

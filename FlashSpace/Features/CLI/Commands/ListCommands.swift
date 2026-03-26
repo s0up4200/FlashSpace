@@ -61,7 +61,7 @@ final class ListCommands: CommandExecutor {
                 .filter { !onlyRunning || runningApps.contains($0.bundleIdentifier) }
                 .map { app in
                     [
-                        app.name,
+                        app.displayName,
                         withBundleId ? app.bundleIdentifier : nil,
                         withIcon ? app.iconPath ?? "" : nil
                     ].compactMap { $0 }.joined(separator: ",")

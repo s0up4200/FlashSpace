@@ -109,3 +109,25 @@ targets:
           cp "$SOURCE_PATH" "$DESTINATION_PATH"
         basedOnDependencyAnalysis: false
         showEnvVars: false
+
+  FlashSpaceTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [FlashSpaceTests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FlashSpace-Dev.app/Contents/MacOS/FlashSpace-Dev"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: FlashSpace
+
+schemes:
+  FlashSpace:
+    build:
+      targets:
+        FlashSpace: all
+    test:
+      targets:
+        - FlashSpaceTests

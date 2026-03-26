@@ -5,6 +5,8 @@
 
 # ⚡ FlashSpace
 
+> Fork notice: this fork exists to support browser-profile-aware workspaces, especially separate Chrome profiles per workspace. Upstream explicitly documents that FlashSpace does not support individual app windows per workspace because it prioritizes native app show/hide, simplicity, performance, and avoiding hacks around the lack of a public macOS API for hiding specific windows. See the upstream design note: https://github.com/wojciech-kulik/FlashSpace#-no-support-for-individual-app-windows-per-workspace
+
 FlashSpace is a blazingly-fast virtual workspace manager for macOS, designed to
 enhance and replace native macOS Spaces. No more waiting for macOS animations.
 
